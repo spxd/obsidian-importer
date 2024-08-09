@@ -1,0 +1,14 @@
+{
+    "folders": [
+        {
+            "name": "root",
+            "path": "."
+        }
+    ],
+    "settings": {
+		"python.terminal.activateEnvironment": true,
+        "files.associations": {
+            "*.md": "markdown"
+        }
+    }
+}

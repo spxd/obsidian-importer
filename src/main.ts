@@ -212,6 +212,8 @@ export class ImportContext {
 export default class ImporterPlugin extends Plugin {
 	importers: Record<string, ImporterDefinition>;
 
+	importerModal: ImporterModal | null = null;
+
 	authCallback: AuthCallback | undefined;
 
 	async onload() {
@@ -275,14 +277,20 @@ export default class ImporterPlugin extends Plugin {
 		};
 
 		this.addRibbonIcon('lucide-import', 'Open Importer', () => {
-			new ImporterModal(this.app, this).open();
+			if (!this.importerModal) {
+				this.importerModal = new ImporterModal(this.app, this);
+			}
+			this.importerModal.open();
 		});
 
 		this.addCommand({
 			id: 'open-modal',
 			name: 'Open importer',
 			callback: () => {
-				new ImporterModal(this.app, this).open();
+				if (!this.importerModal) {
+					this.importerModal = new ImporterModal(this.app, this);
+				}
+				this.importerModal.open();
 			},
 		});
 
@@ -407,6 +415,7 @@ export class ImporterModal extends Modal {
 							el.addEventListener('click', () => {
 								ctx.cancel();
 								cancelButtonEl.detach();
+								this.closeInstance();
 							});
 						});
 						try {
@@ -421,7 +430,10 @@ export class ImporterModal extends Modal {
 							});
 							cancelButtonEl.detach();
 							buttonsEl.createEl('button', { cls: 'mod-cta', text: 'Done' }, el => {
-								el.addEventListener('click', () => this.close());
+								el.addEventListener('click', () => {
+									this.close();
+									this.closeInstance();
+								});
 							});
 							ctx.hideStatus();
 						}
@@ -431,11 +443,24 @@ export class ImporterModal extends Modal {
 		}
 	}
 
-	onClose() {
+	closeInstance() {
 		const { contentEl, current } = this;
 		contentEl.empty();
 		if (current) {
 			current.cancel();
 		}
+		this.plugin.importerModal = null;
+		this.onClose();
+		super.close();
+	}
+
+	onClose() {
+		// console.log('ImporterModal closing');
+		// const { contentEl, current } = this;
+		// contentEl.empty();
+		// if (current) {
+		// 	current.cancel();
+		// }
+		// this.plugin.importerModal = null;
 	}
 }

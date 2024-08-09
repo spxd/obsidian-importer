@@ -5,20 +5,96 @@ import { FormatImporter } from '../format-importer';
 import { ATTACHMENT_EXTS, AUTH_REDIRECT_URI, ImportContext } from '../main';
 import { AccessTokenResponse } from './onenote/models';
 
-const GRAPH_CLIENT_ID: string = '66553851-08fa-44f2-8bb1-1436f121a73d';
-const GRAPH_SCOPES: string[] = ['user.read', 'notes.read'];
+// const GRAPH_CLIENT_ID: string = '66553851-08fa-44f2-8bb1-1436f121a73d'; // default
+const GRAPH_CLIENT_ID: string = '1431ce75-e37a-4960-a07e-829f47d1b62f';
+const GRAPH_TENANT_ID: string = 'common';
+// const GRAPH_TENANT_ID: string = '28b15cb4-8f40-4a9e-a22b-955e936b44c3';
+const GRAPH_SCOPES: string[] = ['user.read', 'notes.read', 'offline_access'];
 // Regex for fixing broken HTML returned by the OneNote API
 const SELF_CLOSING_REGEX = /<(object|iframe)([^>]*)\/>/g;
 // Regex for fixing whitespace and paragraphs
 const PARAGRAPH_REGEX = /(<\/p>)\s*(<p[^>]*>)|\n  \n/g;
 // Maximum amount of request retries, before they're marked as failed
-const MAX_RETRY_ATTEMPTS = 5;
+
+const MAX_RETRY_ATTEMPTS = 60;
+const DOWNLOAD_INTERVAL = 10;
+
+// const RATE_LIMIT_WAIT = 40;
+const RATE_LIMIT_RETRY = 60;
+
+// // for sleep function
+// function sleep(ms: number | undefined) {
+// 	console.log(`Sleeping for ${ms} ms`);
+// 	return new Promise(resolve => setTimeout(resolve, ms));
+// }
+
+class Lock {
+	_locked: boolean;
+	_waiting: Array<() => void>;
+
+	constructor() {
+		this._locked = false;
+		this._waiting = [];
+	}
+
+	async acquire() {
+		if (this._locked) {
+			// @ts-ignore
+			await new Promise(resolve => this._waiting.push(resolve));
+		}
+		this._locked = true;
+	}
+
+	release() {
+		if (this._waiting.length > 0) {
+			const next = this._waiting.shift();
+			if (next) {
+			  next();
+			}
+		} 
+		else {
+			this._locked = false;
+		}
+	}
+}
+
+
+class AsyncLock {
+	_locked: boolean;
+	_waiting: Array<(unlock: () => void) => void>;
+
+	constructor() {
+		this._locked = false;
+		this._waiting = [];
+	}
+
+	async lock() {
+		const unlock = () => {
+			this._locked = false;
+			if (this._waiting.length > 0) {
+				const nextUnlock = this._waiting.shift();
+				if (nextUnlock) {
+					nextUnlock(unlock);
+				}
+			}
+		};
+
+		if (this._locked) {
+			await new Promise((resolve) => this._waiting.push(resolve));
+		} 
+		else {
+			this._locked = true;
+			return unlock;
+		}
+	}
+}
 
 export class OneNoteImporter extends FormatImporter {
 	// Settings
 	outputFolder: TFolder | null;
-	useDefaultAttachmentFolder: boolean = true;
+	useDefaultAttachmentFolder: boolean = false;
 	importIncompatibleAttachments: boolean = false;
+	download_interval: number = DOWNLOAD_INTERVAL;
 	// UI
 	microsoftAccountSetting: Setting;
 	contentArea: HTMLDivElement;
@@ -28,24 +104,36 @@ export class OneNoteImporter extends FormatImporter {
 	graphData = {
 		state: genUid(32),
 		accessToken: '',
+		refreshToken: '',
+		expire_in: new Date()
 	};
+	lock = new Lock();
+	asyncLock = new AsyncLock();
 
 	init() {
 		this.addOutputLocationSetting('OneNote');
-
+		
+		// Settings
 		new Setting(this.modal.contentEl)
 			.setName('Use the default attachment folder')
 			.setDesc('If disabled, attachments will be stored in the export folder in the OneNote Attachments folder.')
 			.addToggle((toggle) => toggle
-				.setValue(true)
+				.setValue(this.useDefaultAttachmentFolder)
 				.onChange((value) => (this.useDefaultAttachmentFolder = value))
 			);
 		new Setting(this.modal.contentEl)
 			.setName('Import incompatible attachments')
 			.setDesc('Imports incompatible attachments which cannot be embedded in Obsidian, such as .exe files.')
 			.addToggle((toggle) => toggle
-				.setValue(false)
+				.setValue(this.importIncompatibleAttachments)
 				.onChange((value) => (this.importIncompatibleAttachments = value))
+			);
+		new Setting(this.modal.contentEl)
+			.setName('Download interval')
+			.setDesc('Time in seconds to wait between each download. This is useful to prevent rate limiting.')
+			.addText((text) => text
+				.setValue(DOWNLOAD_INTERVAL.toString())
+				.onChange((value) => (this.download_interval = parseInt(value)))
 			);
 		this.microsoftAccountSetting =
 			new Setting(this.modal.contentEl)
@@ -56,7 +144,6 @@ export class OneNoteImporter extends FormatImporter {
 					.setButtonText('Sign in')
 					.onClick(() => {
 						this.registerAuthCallback(this.authenticateUser.bind(this));
-
 						const requestBody = new URLSearchParams({
 							client_id: GRAPH_CLIENT_ID,
 							scope: GRAPH_SCOPES.join(' '),
@@ -65,7 +152,7 @@ export class OneNoteImporter extends FormatImporter {
 							response_mode: 'query',
 							state: this.graphData.state,
 						});
-						window.open(`https://login.microsoftonline.com/common/oauth2/v2.0/authorize?${requestBody.toString()}`);
+						window.open(`https://login.microsoftonline.com/${GRAPH_TENANT_ID}/oauth2/v2.0/authorize?${requestBody.toString()}`);
 					})
 				);
 		this.contentArea = this.modal.contentEl.createEl('div');
@@ -76,27 +163,8 @@ export class OneNoteImporter extends FormatImporter {
 			if (protocolData['state'] !== this.graphData.state) {
 				throw new Error(`An incorrect state was returned.\nExpected state: ${this.graphData.state}\nReturned state: ${protocolData['state']}`);
 			}
+			await this.initToken(protocolData);
 
-			const requestBody = new URLSearchParams({
-				client_id: GRAPH_CLIENT_ID,
-				scope: GRAPH_SCOPES.join(' '),
-				code: protocolData['code'],
-				redirect_uri: AUTH_REDIRECT_URI,
-				grant_type: 'authorization_code',
-			});
-
-			const tokenResponse: AccessTokenResponse = await requestUrl({
-				method: 'POST',
-				url: 'https://login.microsoftonline.com/common/oauth2/v2.0/token',
-				contentType: 'application/x-www-form-urlencoded',
-				body: requestBody.toString(),
-			}).json;
-
-			if (!tokenResponse.access_token) {
-				throw new Error(`Unexpected data was returned instead of an access token. Error details: ${tokenResponse}`);
-			}
-
-			this.graphData.accessToken = tokenResponse.access_token;
 			// Emptying, as the user may have leftover selections from previous sign-in attempt
 			this.selectedIds = [];
 			const userData: User = await this.fetchResource('https://graph.microsoft.com/v1.0/me', 'json');
@@ -111,6 +179,79 @@ export class OneNoteImporter extends FormatImporter {
 			this.modal.contentEl.createEl('div', { text: 'An error occurred while trying to sign you in.' })
 				.createEl('details', { text: e })
 				.createEl('summary', { text: 'Click here to show error details' });
+		}
+	}
+
+	async initToken(protocolData: ObsidianProtocolData) {
+		console.log('Getting token...');
+
+		const requestBody = new URLSearchParams({
+			client_id: GRAPH_CLIENT_ID,
+			scope: GRAPH_SCOPES.join(' '),
+			code: protocolData['code'],
+			redirect_uri: AUTH_REDIRECT_URI,
+			grant_type: 'authorization_code',
+			// client_secret: GRAPH_CLIENT_SECRET
+		});
+
+		const tokenResponse: AccessTokenResponse = await requestUrl({
+			method: 'POST',
+			url: `https://login.microsoftonline.com/${GRAPH_TENANT_ID}/oauth2/v2.0/token`,
+			contentType: 'application/x-www-form-urlencoded',
+			body: requestBody.toString(),
+		}).json;
+
+		if (!tokenResponse.access_token) {
+			throw new Error(`Unexpected data was returned instead of an access token. Error details: ${tokenResponse}`);
+		}
+
+		console.log('Token response:', tokenResponse);
+		console.log('Token expires in:', tokenResponse.expires_in);
+
+		this.graphData.accessToken = tokenResponse.access_token;
+		this.graphData.refreshToken = tokenResponse.refresh_token!;
+		let now = new Date();
+		this.graphData.expire_in = new Date(now.getTime() + (tokenResponse.expires_in - 600) * 1000);
+
+		console.log('Set Expire in:', this.graphData.expire_in);
+	}
+
+	// refresh token
+	async refreshToken() {
+		try {
+			console.log('Refreshing token...');
+			const requestBody = new URLSearchParams({
+				client_id: GRAPH_CLIENT_ID,
+				scope: GRAPH_SCOPES.join(' '),
+				grant_type: 'refresh_token',
+				refresh_token: this.graphData.refreshToken,
+				// client_secret: GRAPH_CLIENT_SECRET,
+			});
+
+			const tokenResponse: AccessTokenResponse = await requestUrl({
+				method: 'POST',
+				url: `https://login.microsoftonline.com/${GRAPH_TENANT_ID}/oauth2/v2.0/token`,
+				contentType: 'application/x-www-form-urlencoded',
+				body: requestBody.toString(),
+			}).json;
+
+			if (!tokenResponse.access_token) {
+				throw new Error(`Unexpected data was returned instead of an access token. Error details: ${tokenResponse}`);
+			}
+
+			console.log('Token response:', tokenResponse);
+			console.log('Token expires in:', tokenResponse.expires_in);
+
+			this.graphData.accessToken = tokenResponse.access_token;
+			this.graphData.refreshToken = tokenResponse.refresh_token!;
+			let now = new Date();
+			this.graphData.expire_in = new Date(now.getTime() + (tokenResponse.expires_in - 600) * 1000);
+
+			console.log('Set Expire in:', this.graphData.expire_in);
+		}
+		catch (e) {
+			console.error('An error occurred while trying to refresh the token. Error details: ', e);
+			throw e;
 		}
 	}
 
@@ -229,6 +370,7 @@ export class OneNoteImporter extends FormatImporter {
 		}
 
 		progress.status('Starting OneNote import');
+
 		let progressTotal = 0;
 		let progressCurrent = 0;
 
@@ -244,6 +386,7 @@ export class OneNoteImporter extends FormatImporter {
 
 			const pagesUrl = `${baseUrl}?${params.toString()}`;
 
+			console.log('Fetching pages from:', pagesUrl);
 			let pages: OnenotePage[] = ((await this.fetchResource(pagesUrl, 'json')).value);
 			progressTotal += pages.length;
 			this.insertPagesToSection(pages, sectionId);
@@ -255,11 +398,10 @@ export class OneNoteImporter extends FormatImporter {
 				if (!page.title) page.title = `Untitled-${moment().format('YYYYMMDDHHmmss')}`;
 				try {
 					progress.status(`Importing note ${page.title}`);
-
-					// Every 50 items, do a few second break to prevent rate limiting
-					if (i !== 0 && i % 50 === 0) {
-						await new Promise(resolve => setTimeout(resolve, 7500));
-					}
+					// // Every 10 items, do a few second break to prevent rate limiting
+					// if (i !== 0 && i % 10 === 0) {
+					// 	await new Promise(resolve => setTimeout(resolve, RATE_LIMIT_WAIT * 1000));
+					// }
 
 					this.processFile(progress,
 						await this.fetchResource(`https://graph.microsoft.com/v1.0/me/onenote/pages/${page.id}/content?includeInkML=true`, 'text'),
@@ -269,6 +411,7 @@ export class OneNoteImporter extends FormatImporter {
 					progress.reportProgress(progressCurrent, progressTotal);
 				}
 				catch (e) {
+					console.error('An error occurred while trying to import a note. Error details: ', e);
 					progress.reportFailed(page.title, e.toString());
 				}
 			}
@@ -311,7 +454,6 @@ export class OneNoteImporter extends FormatImporter {
 			if (!await this.vault.adapter.exists(outputPath)) pageFolder = await this.vault.createFolder(outputPath);
 			else pageFolder = this.vault.getAbstractFileByPath(outputPath) as TFolder;
 
-
 			let taggedPage = this.convertTags(parseHTML(splitContent.html));
 			let data = this.getAllAttachments(taggedPage.replace(PARAGRAPH_REGEX, '<br />'));
 			let parsedPage = this.styledElementToHTML(data.html);
@@ -336,6 +478,7 @@ export class OneNoteImporter extends FormatImporter {
 			progress.reportNoteSuccess(page.title!);
 		}
 		catch (e) {
+			console.error('An error occurred while trying to import a note. Error details: ', e);
 			progress.reportFailed(page.title!, e);
 		}
 	}
@@ -568,20 +711,25 @@ export class OneNoteImporter extends FormatImporter {
 			let attachmentPath: string = outputFolder.path + '/OneNote Attachments';
 			// @ts-ignore
 			// Bug: This function always returns the path + "Note name.md" rather than just the path for some reason
-			if (this.useDefaultAttachmentFolder) attachmentPath = await this.app.vault.getAvailablePathForAttachments(currentFile.basename, currentFile.extension, currentFile);
+			if (this.useDefaultAttachmentFolder) attachmentPath = attachmentPath + '/' + (await this.app.vault.getAvailablePathForAttachments(currentFile.basename, currentFile.extension, currentFile));
 
 			// Create the attachment folder if it doesn't exist yet
 			try {
+				console.log('Creating attachment folder:', attachmentPath);
 				this.vault.createFolder(attachmentPath);
+				// if (!this.vault.adapter.exists(attachmentPath)) {
+				// 	console.log('Attachment folder does not exist, creating it now.');
+				// 	this.vault.createFolder(attachmentPath);
+				// }
 			}
 			catch (e) { }
 			for (let i = 0; i < attachmentQueue.length; i++) {
 				const attachment = attachmentQueue[i];
 				try {
-					// Every 7 attachments, do a few second break to prevent rate limiting
-					if (i !== 0 && i % 7 === 0) {
-						await new Promise(resolve => setTimeout(resolve, 7500));
-					}
+					// Every 3 attachments, do a few second break to prevent rate limiting
+					// if (i !== 0 && i % 3 === 0) {
+					// 	await new Promise(resolve => setTimeout(resolve, RATE_LIMIT_WAIT * 1000));
+					// }
 
 					if (!(await this.vault.adapter.exists(`${attachmentPath}/${attachment.name}`))) {
 						const data = (await this.fetchResource(attachment.contentLocation!, 'file')) as ArrayBuffer;
@@ -590,6 +738,7 @@ export class OneNoteImporter extends FormatImporter {
 					else progress.reportSkipped(attachment.name!);
 				}
 				catch (e) {
+					console.error('An error occurred while trying to download an attachment. Error details: ', e);
 					progress.reportFailed(attachment.name!, e);
 				}
 			}
@@ -671,16 +820,46 @@ export class OneNoteImporter extends FormatImporter {
 		return element;
 	}
 
+
+
 	// Fetches an Microsoft Graph resource and automatically handles rate-limits/errors
 	async fetchResource(url: string, returnType: 'text', retryCount?: number | undefined): Promise<string>;
 	async fetchResource(url: string, returnType: 'file', retryCount?: number | undefined): Promise<ArrayBuffer>;
 	async fetchResource(url: string, returnType: 'json', retryCount?: number | undefined): Promise<any>;
 	async fetchResource(url: string, returnType: 'text' | 'file' | 'json' = 'json', retryCount: number = 0): Promise<string | ArrayBuffer | any> {
-		try {
-			let response = await fetch(url, { headers: { Authorization: `Bearer ${this.graphData.accessToken}` } });
-			let responseBody;
+		if (retryCount === undefined) {
+			retryCount = 0;
+		} 
 
-			if (response.ok) {
+		try {
+			if (this.download_interval > 0) {
+				console.log(`Waiting for ${this.download_interval} seconds before fetching:`); 
+				await new Promise(resolve => setTimeout(resolve, this.download_interval * 1000));
+			} 
+			let unlock = undefined;
+			let response;
+			let responseBody;
+			try {
+				console.log(`${retryCount}: Fetching resource: ${url}`);
+				// await this.lock.acquire();
+				unlock = await this.asyncLock.lock();
+				// refresh token
+				let now = new Date();
+				// If the token is about to expire, refresh it with the refresh token
+				if (now >= this.graphData.expire_in) {
+					await this.refreshToken();
+				}
+				response = await fetch(url, { headers: { Authorization: `Bearer ${this.graphData.accessToken}` } });
+			}
+			finally {
+				// this.lock.release();
+				if (unlock) {
+					unlock();
+				}
+			}
+
+			if (response?.ok) {
+				console.log('Completed fetch');
 				switch (returnType) {
 					case 'text':
 						responseBody = await response.text();
@@ -697,27 +876,31 @@ export class OneNoteImporter extends FormatImporter {
 				}
 			}
 			else {
-				const err: PublicError = await response.json();
-
-				console.log('An error has occurred while fetching an resource:', err);
-
-				// We're rate-limited - let's retry after the suggested amount of time
-				if (err.code === '20166') {
-					let retryTime = (+!response.headers.get('Retry-After') * 1000) || 15000;
-					console.log(`Rate limit exceeded, waiting for: ${retryTime} ms`);
-
-					if (retryCount < MAX_RETRY_ATTEMPTS) {
-						await new Promise(resolve => setTimeout(resolve, retryTime));
-						return this.fetchResource(url, returnType as any, retryCount + 1);
+				// @ts-ignore
+				const e: any = await response.json();
+				if ('error' in e) {
+					let err: PublicError = e.error;
+					console.error('An error has occurred while fetching an resource:', err);
+					// We're rate-limited - let's retry after the suggested amount of time
+					if (err.code === '20166') {
+						let retryTime = RATE_LIMIT_RETRY;
+						if (response?.headers.get('Retry-After')) {
+							console.log('Retry-After:', response.headers.get('Retry-After'));
+							retryTime = parseInt(response.headers.get('Retry-After') || RATE_LIMIT_RETRY.toString()) + 10;
+						}
+						console.error(`Rate limit exceeded, waiting for: ${retryTime} sec`);
+						if (retryCount < MAX_RETRY_ATTEMPTS) {
+							await new Promise(resolve => setTimeout(resolve, retryTime * 1000));
+							return (await this.fetchResource(url, returnType as any, retryCount + 1));
+						}
+						else throw new Error('Exceeded maximum retry attempts');
 					}
-					else throw new Error('Exceeded maximum retry attempts');
 				}
 			}
 			return responseBody;
 		}
 		catch (e) {
 			console.error(`An internal error occurred while trying to fetch '${url}'. Error details: `, e);
-
 			throw e;
 		}
 	}
